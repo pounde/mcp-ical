@@ -1,5 +1,5 @@
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from threading import Semaphore
 from typing import Any
 
@@ -12,6 +12,7 @@ from EventKit import (
     EKSpanFutureEvents,  # type: ignore
     EKSpanThisEvent,  # type: ignore
 )
+from Foundation import NSURL, NSTimeZone  # type: ignore
 from loguru import logger
 
 from .models import (
@@ -96,7 +97,7 @@ class CalendarManager:
         if new_event.location:
             ekevent.setLocation_(new_event.location)
         if new_event.url:
-            ekevent.setURL_(new_event.url)
+            ekevent.setURL_(NSURL.URLWithString_(new_event.url))
         if new_event.all_day:
             ekevent.setAllDay_(new_event.all_day)
 
@@ -108,6 +109,15 @@ class CalendarManager:
 
         if new_event.recurrence_rule:
             ekevent.setRecurrenceRule_(new_event.recurrence_rule.to_ek_recurrence())
+
+        # Set timezone if specified (allows creating events in a different timezone, e.g., "dinner at 7pm Paris time")
+        if new_event.timezone:
+            tz = NSTimeZone.timeZoneWithName_(new_event.timezone)
+            if tz:
+                ekevent.setTimeZone_(tz)
+                logger.debug(f"Set event timezone to: {new_event.timezone}")
+            else:
+                logger.warning(f"Invalid timezone identifier: {new_event.timezone}, using local timezone")
 
         if new_event.calendar_name:
             calendar = self._find_calendar_by_name(new_event.calendar_name)
@@ -136,19 +146,44 @@ class CalendarManager:
             logger.exception(e)
             raise
 
-    def update_event(self, event_id: str, request: UpdateEventRequest) -> Event:
-        """Update an existing event by its identifier
+    def update_event(
+        self,
+        event_id: str,
+        request: UpdateEventRequest,
+        update_future_events: bool = False,
+        occurrence_date: datetime | None = None,
+    ) -> Event:
+        """Update an existing event or a specific occurrence of a recurring event.
 
         Args:
             event_id: The unique identifier of the event to update
             request: The update request containing the fields to modify
+            update_future_events: When True with occurrence_date, updates this occurrence and all future ones.
+                                 When False (default) with occurrence_date, updates only this specific occurrence.
+                                 Ignored when occurrence_date is None.
+            occurrence_date: The exact start time of the occurrence to update.
+                           If provided, updates only that specific occurrence.
+                           If None, updates all occurrences (existing behavior).
 
         Returns:
-            Event | None: The updated event if successful, None if failed
+            Event: The updated event if successful
+
+        Raises:
+            NoSuchEventException: If the event or occurrence is not found
+            NoSuchCalendarException: If the requested calendar doesn't exist
         """
-        existing_event = self.find_event_by_id(event_id)
-        if not existing_event:
-            raise NoSuchEventException(event_id)
+        # If updating a specific occurrence, find it; otherwise find the master event
+        if occurrence_date:
+            existing_event = self.find_event_occurrence(event_id, occurrence_date)
+            if not existing_event:
+                raise NoSuchEventException(
+                    f"{event_id} at {occurrence_date.isoformat()} - occurrence not found"
+                )
+            logger.info(f"Found occurrence for update at {occurrence_date.isoformat()}")
+        else:
+            existing_event = self.find_event_by_id(event_id)
+            if not existing_event:
+                raise NoSuchEventException(event_id)
 
         existing_ek_event = existing_event._raw_event
         if not existing_ek_event:
@@ -165,7 +200,7 @@ class CalendarManager:
         if request.notes is not None:
             existing_ek_event.setNotes_(request.notes)
         if request.url is not None:
-            existing_ek_event.setURL_(request.url)
+            existing_ek_event.setURL_(NSURL.URLWithString_(request.url))
         if request.all_day is not None:
             existing_ek_event.setAllDay_(request.all_day)
 
@@ -181,6 +216,15 @@ class CalendarManager:
         if request.recurrence_rule is not None:
             existing_ek_event.setRecurrenceRule_(request.recurrence_rule.to_ek_recurrence())
 
+        # Update timezone if specified
+        if request.timezone is not None:
+            tz = NSTimeZone.timeZoneWithName_(request.timezone)
+            if tz:
+                existing_ek_event.setTimeZone_(tz)
+                logger.debug(f"Updated event timezone to: {request.timezone}")
+            else:
+                logger.warning(f"Invalid timezone identifier: {request.timezone}, timezone not updated")
+
         # Update alarms if specified
         if request.alarms_minutes_offsets is not None:
             alarms = []
@@ -192,25 +236,50 @@ class CalendarManager:
             existing_ek_event.setAlarms_(alarms)
 
         try:
-            # Use EKSpanFutureEvents to update all future events in the case the event is a recurring one
-            success, error = self.event_store.saveEvent_span_error_(existing_ek_event, EKSpanFutureEvents, None)
+            # Determine the correct span based on parameters
+            # - If occurrence_date is provided and update_future_events is True: update this and all future
+            # - If occurrence_date is provided and update_future_events is False: update only this one
+            # - If occurrence_date is None: update all occurrences (backward compatibility)
+            if occurrence_date and update_future_events:
+                span = EKSpanFutureEvents  # This occurrence and all future ones
+            elif occurrence_date:
+                span = EKSpanThisEvent  # Only this specific occurrence
+            else:
+                span = EKSpanFutureEvents  # All occurrences (maintains backward compatibility)
+
+            success, error = self.event_store.saveEvent_span_error_(existing_ek_event, span, None)
 
             if not success:
                 logger.error(f"Failed to update event: {error}")
                 raise Exception(error)
 
-            logger.info(f"Successfully updated event: {request.title or existing_event.title}")
+            # Build log message based on what was updated
+            if occurrence_date and update_future_events:
+                scope = f"occurrence at {occurrence_date.isoformat()} and all future occurrences"
+            elif occurrence_date:
+                scope = f"occurrence at {occurrence_date.isoformat()}"
+            else:
+                scope = "all occurrences"
+
+            logger.info(f"Successfully updated {scope}: {request.title or existing_event.title}")
             return Event.from_ekevent(existing_ek_event)
 
         except Exception as e:
             logger.error(f"Failed to update event: {e}")
             raise
 
-    def delete_event(self, event_id: str) -> bool:
-        """Delete an event by its identifier
+    def delete_event(
+        self, event_id: str, delete_entire_series: bool = False, occurrence_date: datetime | None = None
+    ) -> bool:
+        """Delete an event by its identifier, optionally targeting a specific occurrence or future events
 
         Args:
             event_id: The unique identifier of the event to delete
+            delete_entire_series: When True with occurrence_date, deletes the occurrence and all future ones.
+                                 When True without occurrence_date, deletes all occurrences.
+                                 When False (default), deletes only the specific occurrence.
+            occurrence_date: Datetime of specific occurrence to target.
+                             Required when deleting a specific occurrence of a recurring event.
 
         Returns:
             bool: True if deletion was successful, False otherwise
@@ -218,23 +287,47 @@ class CalendarManager:
         Raises:
             NoSuchEventException: If the event with the given ID doesn't exist
             Exception: If there was an error deleting the event
+
+        Behavior:
+            - Non-recurring event: Just use event_id (delete_entire_series is ignored)
+            - Delete one occurrence: provide occurrence_date, delete_entire_series=False (default)
+            - Delete from occurrence forward: provide occurrence_date, delete_entire_series=True
+            - Delete all occurrences: event_id only, delete_entire_series=True
         """
-        existing_event = self.find_event_by_id(event_id)
-        if not existing_event:
-            raise NoSuchEventException(event_id)
+        # If occurrence_date is provided, find the specific occurrence
+        if occurrence_date:
+            existing_event = self.find_event_occurrence(event_id, occurrence_date)
+            if not existing_event:
+                raise NoSuchEventException(f"{event_id} at {occurrence_date.isoformat()}")
+        else:
+            existing_event = self.find_event_by_id(event_id)
+            if not existing_event:
+                raise NoSuchEventException(event_id)
 
         existing_ek_event = existing_event._raw_event
         if not existing_ek_event:
             raise NoSuchEventException(event_id)
 
         try:
-            success, error = self.event_store.removeEvent_span_error_(existing_ek_event, EKSpanFutureEvents, None)
+            # Use EKSpanFutureEvents to delete all future occurrences, or EKSpanThisEvent for just this one
+            span = EKSpanFutureEvents if delete_entire_series else EKSpanThisEvent
+            success, error = self.event_store.removeEvent_span_error_(existing_ek_event, span, None)
 
             if not success:
                 logger.error(f"Failed to delete event: {error}")
                 raise Exception(error)
 
-            logger.info(f"Successfully deleted event: {existing_event.title}")
+            # Build log message based on what was deleted
+            if occurrence_date and delete_entire_series:
+                scope = f"occurrence at {occurrence_date.isoformat()} and all future occurrences"
+            elif occurrence_date:
+                scope = f"occurrence at {occurrence_date.isoformat()}"
+            elif delete_entire_series:
+                scope = "all occurrences"
+            else:
+                scope = "event"
+
+            logger.info(f"Successfully deleted: {existing_event.title} {scope}")
             return True
 
         except Exception as e:
@@ -256,6 +349,56 @@ class CalendarManager:
             return None
 
         return Event.from_ekevent(ekevent)
+
+    def find_event_occurrence(self, event_id: str, occurrence_date: datetime) -> Event | None:
+        """Find a specific occurrence of a recurring event.
+
+        Searches for events near the occurrence_date and matches by comparing datetimes.
+        If the datetime has no timezone, tries both as-provided and UTC interpretations.
+
+        Args:
+            event_id: The event identifier
+            occurrence_date: Start time of the occurrence
+
+        Returns:
+            The matching occurrence, or None if not found
+        """
+        result = self._search_occurrence_by_datetime(event_id, occurrence_date)
+        if result:
+            return result
+
+        # If naive datetime, try UTC interpretation (common when Claude constructs local times)
+        if occurrence_date.tzinfo is None:
+            logger.info(f"No match for {event_id}, trying UTC interpretation of {occurrence_date}")
+            utc_datetime = occurrence_date.replace(tzinfo=timezone.utc)
+            result = self._search_occurrence_by_datetime(event_id, utc_datetime)
+            if result:
+                logger.info("Found match using UTC interpretation")
+                return result
+
+        logger.info(f"No occurrence found for {event_id} at {occurrence_date}")
+        return None
+
+    def _search_occurrence_by_datetime(self, event_id: str, target_datetime: datetime) -> Event | None:
+        """Search for occurrence by datetime.
+
+        Uses a minimal ±1 minute search window (required by EventKit's predicate API),
+        then does exact datetime matching with ==.
+        """
+        search_start = target_datetime - timedelta(minutes=1)
+        search_end = target_datetime + timedelta(minutes=1)
+
+        predicate = self.event_store.predicateForEventsWithStartDate_endDate_calendars_(
+            search_start, search_end, None
+        )
+        events = self.event_store.eventsMatchingPredicate_(predicate)
+
+        for ekevent in events:
+            if ekevent.eventIdentifier() == event_id and ekevent.startDate() == target_datetime:
+                logger.debug(f"Found occurrence for {event_id} at {target_datetime}")
+                return Event.from_ekevent(ekevent)
+
+        return None
 
     def list_calendar_names(self) -> list[str]:
         """List all available calendar names

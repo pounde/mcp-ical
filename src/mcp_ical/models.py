@@ -148,10 +148,15 @@ class Event:
                 else None,
             )
 
+        # Convert NSDate to Python datetime in local timezone
+        # NSDate stores timestamps in UTC; fromtimestamp converts to local time
+        start_time = convert_datetime(ekevent.startDate())
+        end_time = convert_datetime(ekevent.endDate())
+
         return cls(
             title=ekevent.title(),
-            start_time=ekevent.startDate(),
-            end_time=ekevent.endDate(),
+            start_time=start_time,
+            end_time=end_time,
             calendar_name=ekevent.calendar().title(),
             location=ekevent.location(),
             notes=ekevent.notes(),
@@ -163,7 +168,7 @@ class Event:
             status=ekevent.status(),
             organizer=str(ekevent.organizer().name()) if ekevent.organizer() else None,
             attendees=attendees,
-            last_modified=ekevent.lastModifiedDate(),
+            last_modified=convert_datetime(ekevent.lastModifiedDate()) if ekevent.lastModifiedDate() else None,
             identifier=ekevent.eventIdentifier(),
             _raw_event=ekevent,
         )
@@ -211,6 +216,7 @@ class CreateEventRequest(BaseModel):
     url: str | None = None
     all_day: bool = False
     recurrence_rule: RecurrenceRule | None = None
+    timezone: str | None = None  # IANA timezone identifier (e.g., "Europe/Paris", "America/New_York")
 
 
 class UpdateEventRequest(BaseModel):
@@ -224,3 +230,4 @@ class UpdateEventRequest(BaseModel):
     url: str | None = None
     all_day: bool | None = None
     recurrence_rule: RecurrenceRule | None = None
+    timezone: str | None = None  # IANA timezone identifier (e.g., "Europe/Paris", "America/New_York")
