@@ -112,6 +112,7 @@ class Event:
     attendees: list[str] | None = None
     last_modified: FlexibleDateTime | None = None
     recurrence_rule: RecurrenceRule | None = None
+    timezone: str | None = None  # IANA timezone from EventKit (e.g., "US/Eastern", None for floating)
     _raw_event: EKEvent | None = None  # Store the original EKEvent object
 
     @classmethod
@@ -153,6 +154,10 @@ class Event:
         start_time = convert_datetime(ekevent.startDate())
         end_time = convert_datetime(ekevent.endDate())
 
+        # Extract timezone name from EventKit (None means floating time)
+        tz = ekevent.timeZone()
+        timezone_name = str(tz.name()) if tz else None
+
         return cls(
             title=ekevent.title(),
             start_time=start_time,
@@ -170,6 +175,7 @@ class Event:
             attendees=attendees,
             last_modified=convert_datetime(ekevent.lastModifiedDate()) if ekevent.lastModifiedDate() else None,
             identifier=ekevent.eventIdentifier(),
+            timezone=timezone_name,
             _raw_event=ekevent,
         )
 
@@ -197,6 +203,7 @@ class Event:
             f" - Notes: {self.notes or 'N/A'},\n"
             f" - Alarms (minutes before): {alarms_list},\n"
             f" - URL: {self.url or 'N/A'},\n"
+            f" - Timezone: {self.timezone or 'Floating'},\n"
             f" - All Day Event?: {self.all_day},\n"
             f" - Status: {self.status or 'N/A'},\n"
             f" - Organizer: {self.organizer or 'N/A'},\n"
